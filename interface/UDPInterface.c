@@ -23,6 +23,8 @@
 #include "util/platform/Sockaddr.h"
 #include "wire/Message.h"
 
+#include <stdlib.h>
+
 int UDPInterface_beginConnection(const char* address,
                                  uint8_t cryptoKey[32],
                                  String* password,
@@ -30,19 +32,46 @@ int UDPInterface_beginConnection(const char* address,
 {
     struct UDPInterface_pvt* udpif = (struct UDPInterface_pvt*) udp;
     struct Sockaddr_storage ss;
-    if (Sockaddr_parse(address, &ss)) {
-        return UDPInterface_beginConnection_BAD_ADDRESS;
+    struct Sockaddr* addr;
+
+    struct Allocator* tempAlloc = Allocator_child(udpif->alloc);
+
+    if (!Sockaddr_parse(address, &ss)) {
+        addr = &ss.addr;
+    } else {
+        // Attempt name resolution
+        String *address2 = String_new(address, tempAlloc);
+        char* lastColon = CString_strrchr(address2->bytes, ':');
+        if (lastColon) {
+            // try it as a hostname.
+            int port = atoi(lastColon+1);
+            if (!port) {
+                Log_critical(udpif->logger, "Couldn't get port number from [%s]", address);
+                exit(-1);
+            }
+            *lastColon = '\0';
+            addr = Sockaddr_fromName(address2->bytes, tempAlloc);
+            if (addr != NULL) {
+                Sockaddr_setPort(addr, port);
+            } else {
+                Log_warn(udpif->logger, "Failed to lookup hostname [%s]", address2->bytes);
+                Allocator_free(tempAlloc);
+                return UDPInterface_beginConnection_BAD_ADDRESS;
+            }
+        } else {
+            Allocator_free(tempAlloc);
+            return UDPInterface_beginConnection_BAD_ADDRESS;
+        }
     }
-    if (Sockaddr_getFamily(&ss.addr) != Sockaddr_getFamily(udp->addr)) {
+
+    if (Sockaddr_getFamily(addr) != Sockaddr_getFamily(udp->addr)) {
         return UDPInterface_beginConnection_ADDRESS_MISMATCH;
     }
 
-    struct Sockaddr* addr = &ss.addr;
 
     char* addrPtr = NULL;
-    int addrLen = Sockaddr_getAddress(&ss.addr, &addrPtr);
+    int addrLen = Sockaddr_getAddress(addr, &addrPtr);
     Assert_true(addrLen > 0);
-    struct Allocator* tempAlloc = Allocator_child(udpif->alloc);
     if (Bits_isZero(addrPtr, addrLen)) {
         // unspec'd address, convert to loopback
         if (Sockaddr_getFamily(addr) == Sockaddr_AF_INET) {
@@ -52,7 +81,7 @@ int UDPInterface_beginConnection(const char* address,
         } else {
             Assert_failure("Sockaddr which is not AF_INET nor AF_INET6");
         }
-        Sockaddr_setPort(addr, Sockaddr_getPort(&ss.addr));
+        Sockaddr_setPort(addr, Sockaddr_getPort(addr));
     }
 
     struct Interface* iface = MultiInterface_ifaceForKey(udpif->multiIface, addr);
